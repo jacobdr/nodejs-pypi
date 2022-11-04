@@ -6,9 +6,10 @@ import subprocess
 import urllib.request
 import libarchive
 import tempfile
+import tarfile
 from email.message import EmailMessage
 from wheel.wheelfile import WheelFile
-from zipfile import ZipInfo, ZIP_DEFLATED, ZipFile
+from zipfile import ZipInfo, ZIP_DEFLATED
 from inspect import cleandoc
 
 
@@ -63,38 +64,45 @@ if _mismatched_versions:
     raise Exception(f"A version mismatch occurred. Check the usage of {_mismatched_versions}")
 
 def _build_virtual_release_archive(docker_image: str, platform: str) -> bytes:
-    binaries_to_copy = [x.split("bin/")[1] for x in [*NODE_BINS, *NODE_OTHER_BINS] if x.startswith("bin")]
-    zip_bytes = io.BytesIO()
-    with tempfile.TemporaryDirectory() as tmpdirname, ZipFile(zip_bytes, "w") as zip_file:
-        subprocess.check_call([
-            "docker",
-            "run",
-            "--rm",
-            f"--platform={platform}",
-            f"--volume={tmpdirname}:/external",
-            "--entrypoint=sh",
-            docker_image,
-            "-c",
-            f"""
-            for binary in {" ".join(binaries_to_copy)}; do
-                cp $(which $binary) /external
-            done
-            chmod 755 /external/*
-            """
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Since npm etc are symlinks we dont copy them here -- the python files shim
+    # to the lib/mode_modules directory where the real implementation lives as nodejs
+    # shebanged executables
+    raw_binaries_to_copy = [x.split("bin/")[1] for x in NODE_BINS if x.startswith("bin")]
+    tarfile_bytes = io.BytesIO()
+    with tempfile.TemporaryDirectory() as tmpdirname, tarfile.open(fileobj=tarfile_bytes, mode="w") as tar:
+        subprocess.check_call(
+            [
+                "docker",
+                "run",
+                "--rm",
+                f"--platform={platform}",
+                f"--volume={tmpdirname}:/external",
+                "--entrypoint=sh",
+                docker_image,
+                "-c",
+                f"""
+                mkdir /external/bin
+                mkdir /external/lib
+                for raw_binary in {" ".join(raw_binaries_to_copy)}; do
+                    cp -P $(which $raw_binary) /external/bin
+                done
+                if [ -d /usr/local/lib/node_modules ]; then
+                    cp -R /usr/local/lib/node_modules /external/lib
+                fi
+                """
+            ],
+        )
 
-        tmpdir_contents = list(pathlib.Path(tmpdirname).glob("*"))
+        tmpdir_contents = list(pathlib.Path(tmpdirname).glob("**/*"))
         for binary in tmpdir_contents:
-            with open(binary, "rb") as f:
-                file_info = ZipInfo(
-                    filename=f"node/bin/{binary.name}",
-                )
-                file_info.external_attr = 0o755 << 16
-                zip_file.writestr(file_info, f.read())
-        
-    zip_bytes.seek(0)
-    return zip_bytes.read()
+            relative_path = binary.relative_to(tmpdirname)
+            if binary.is_file():
+                tar_info = tar.gettarinfo(name=binary, arcname=str("node" / relative_path))
+                with open(binary, "rb") as f:
+                    tar.addfile(tar_info, f)
+    
+    tarfile_bytes.seek(0)
+    return tarfile_bytes.read()
 
 class ReproducibleWheelFile(WheelFile):
     def writestr(self, zinfo, *args, **kwargs):
@@ -224,7 +232,7 @@ def write_nodejs_wheel(out_dir, *, node_version, version, platform, archive):
             elif entry_name in NODE_OTHER_BINS and NODE_OTHER_BINS[entry_name][1]:
                 other_bin = NODE_OTHER_BINS[entry_name][0]
                 init_imports.append(f'from . import {other_bin} as {other_bin}')
-                script_name = '/'.join(os.path.normpath(os.path.join(os.path.dirname(entry.name), entry.linkpath or other_bin)).split('/')[1:])
+                script_name = '/'.join(os.path.normpath(os.path.join(os.path.dirname(entry.name), entry.linkpath)).split('/')[1:])
                 contents[f'nodejs/{NODE_OTHER_BINS[entry_name][0]}.py'] = cleandoc(f"""
                     import os, sys
                     from typing import TYPE_CHECKING

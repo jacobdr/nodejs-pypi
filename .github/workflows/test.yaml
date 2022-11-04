@@ -124,12 +124,12 @@ jobs:
             linux/amd64)
               python_cpu_arch=x86_64
               python_libc_variant=2_12
-              manylinx_variant_year=2010
+              manylinux_variant_year=2010
               ;;
             linux/arm64)
               python_cpu_arch=aarch64
               python_libc_variant=2_17
-              manylinx_variant_year=2014
+              manylinux_variant_year=2014
               ;;
             *)
               echo "Could not parse the CPU architecture"
@@ -142,7 +142,7 @@ jobs:
               python_platform=musllinux_1_1_${python_cpu_arch}
               ;;
             slim-buster | slim-bullseye)
-              python_platform=manylinux_${python_libc_variant}_${python_cpu_arch}.manylinux${manylinx_variant_year}_${python_cpu_arch}
+              python_platform=manylinux_${python_libc_variant}_${python_cpu_arch}.manylinux${manylinux_variant_year}_${python_cpu_arch}
               ;;
             *)
               echo "Could not parse the OS variant"
