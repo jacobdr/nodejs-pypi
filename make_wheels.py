@@ -1,8 +1,12 @@
 import os
 import hashlib
 import pathlib
+import io
+import subprocess
 import urllib.request
 import libarchive
+import tempfile
+import tarfile
 from email.message import EmailMessage
 from wheel.wheelfile import WheelFile
 from zipfile import ZipInfo, ZIP_DEFLATED
@@ -46,17 +50,59 @@ PLATFORMS = {
     'linux-x64':    'manylinux_2_12_x86_64.manylinux2010_x86_64',
     'linux-armv7l': 'manylinux_2_17_armv7l.manylinux2014_armv7l',
     'linux-arm64':  'manylinux_2_17_aarch64.manylinux2014_aarch64',
-    'linux-x64-musl': 'musllinux_1_1_x86_64'
+    'linux-x64-musl': 'musllinux_1_1_x86_64',
+    'linux-arm64-musl': 'musllinux_1_1_aarch64'
 }
 
 # https://github.com/nodejs/unofficial-builds/
 # Versions added here should match the keys above
 UNOFFICIAL_NODEJS_BUILDS = {'linux-x64-musl'}
+DOCKER_BASED_BUILDS = {"linux-arm64-musl"}
 
-_mismatched_versions = UNOFFICIAL_NODEJS_BUILDS - set(PLATFORMS.keys())
+_mismatched_versions = (UNOFFICIAL_NODEJS_BUILDS|DOCKER_BASED_BUILDS) - set(PLATFORMS.keys())
 if _mismatched_versions:
     raise Exception(f"A version mismatch occurred. Check the usage of {_mismatched_versions}")
 
+def _build_virtual_release_archive(docker_image: str, platform: str) -> bytes:
+    # Since npm etc are symlinks we dont copy them here -- the python files shim
+    # to the lib/mode_modules directory where the real implementation lives as nodejs
+    # shebanged executables
+    raw_binaries_to_copy = [x.split("bin/")[1] for x in NODE_BINS if x.startswith("bin")]
+    tarfile_bytes = io.BytesIO()
+    with tempfile.TemporaryDirectory() as tmpdirname, tarfile.open(fileobj=tarfile_bytes, mode="w") as tar:
+        subprocess.check_call(
+            [
+                "docker",
+                "run",
+                "--rm",
+                f"--platform={platform}",
+                f"--volume={tmpdirname}:/external",
+                "--entrypoint=sh",
+                docker_image,
+                "-c",
+                f"""
+                mkdir /external/bin
+                mkdir /external/lib
+                for raw_binary in {" ".join(raw_binaries_to_copy)}; do
+                    cp -P $(which $raw_binary) /external/bin
+                done
+                if [ -d /usr/local/lib/node_modules ]; then
+                    cp -R /usr/local/lib/node_modules /external/lib
+                fi
+                """
+            ],
+        )
+
+        tmpdir_contents = list(pathlib.Path(tmpdirname).glob("**/*"))
+        for binary in tmpdir_contents:
+            relative_path = binary.relative_to(tmpdirname)
+            if binary.is_file():
+                tar_info = tar.gettarinfo(name=binary, arcname=str("node" / relative_path))
+                with open(binary, "rb") as f:
+                    tar.addfile(tar_info, f)
+    
+    tarfile_bytes.seek(0)
+    return tarfile_bytes.read()
 
 class ReproducibleWheelFile(WheelFile):
     def writestr(self, zinfo, *args, **kwargs):
@@ -312,22 +358,27 @@ def make_nodejs_version(node_version, suffix=''):
         print('Suffix:', suffix)
 
     for node_platform, python_platform in PLATFORMS.items():
-        filetype = 'zip' if node_platform.startswith('win-') else 'tar.xz'
-        if node_platform in UNOFFICIAL_NODEJS_BUILDS:
-            node_url = f'https://unofficial-builds.nodejs.org/download/release/v{node_version}/node-v{node_version}-{node_platform}.{filetype}'
+        if node_platform in DOCKER_BASED_BUILDS:
+            docker_image = f"node:{node_version}-alpine"
+            print(f'- Making Wheel for {node_platform} from docker image {docker_image}')
+            node_archive = _build_virtual_release_archive(docker_image=docker_image, platform="linux/arm64")
         else:
-            node_url = f'https://nodejs.org/dist/v{node_version}/node-v{node_version}-{node_platform}.{filetype}'
+            filetype = 'zip' if node_platform.startswith('win-') else 'tar.xz'
+            if node_platform in UNOFFICIAL_NODEJS_BUILDS:
+                node_url = f'https://unofficial-builds.nodejs.org/download/release/v{node_version}/node-v{node_version}-{node_platform}.{filetype}'
+            else:
+                node_url = f'https://nodejs.org/dist/v{node_version}/node-v{node_version}-{node_platform}.{filetype}'
 
-        print(f'- Making Wheel for {node_platform} from {node_url}')
-        try:
-            with urllib.request.urlopen(node_url) as request:
-                node_archive = request.read()
-                print(f'  {node_url}')
-                print(f'    {hashlib.sha256(node_archive).hexdigest()}')
-        except urllib.error.HTTPError as e:
-            print(f'  {e.code} {e.reason}')
-            print(f'  Skipping {node_platform}')
-            continue
+            print(f'- Making Wheel for {node_platform} from {node_url}')
+            try:
+                with urllib.request.urlopen(node_url) as request:
+                    node_archive: bytes = request.read()
+                    print(f'  {node_url}')
+                    print(f'    {hashlib.sha256(node_archive).hexdigest()}')
+            except urllib.error.HTTPError as e:
+                print(f'  {e.code} {e.reason}')
+                print(f'  Skipping {node_platform}')
+                continue
 
         wheel_path = write_nodejs_wheel('dist/',
             node_version=node_version,
